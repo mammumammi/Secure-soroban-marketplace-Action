@@ -1,0 +1,8 @@
+{
+  "vulnerability": "authorization_bypass",
+  "detected": true,
+  "severity": "CRITICAL",
+  "funds_at_risk_xlm": 100,
+  "estimated_loss_usd": 12.0,
+  "fix": "Add require_auth() to withdraw() function"
+}
