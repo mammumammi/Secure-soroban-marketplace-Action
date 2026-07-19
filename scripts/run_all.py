@@ -15,14 +15,18 @@ DRAIN_CONTRACT_ID    = os.environ.get("DRAIN_CONTRACT_ID",      "CCWEK7ILZYTSCOF
 OVERFLOW_CONTRACT_ID = os.environ.get("OVERFLOW_CONTRACT_ID",   "CCPN3X25DKVUCIYHUTMUM4YI5LZBGOUHQ6VDDVXBNZ32WM7YIHJXTWLJ")
 REENTRANCY_CONTRACT_ID = os.environ.get("REENTRANCY_CONTRACT_ID", "CCC5TMGGNHVQG2PH7PZ3BBLQKKBPAEJICGETSRJ7QNJUYEB7R5N4NDGV")
 
-# All report files relative to project root
+REPORT_DIR = os.environ.get("REPORT_DIR", "scripts")
+
 REPORTS = {
-    "auth_bypass":        "scripts/report.json",
-    "unauthorized_drain": "scripts/drain_report.json",
-    "integer_overflow":   "scripts/overflow_report.json",
-    "reentrancy":         "scripts/reentrancy_report.json",
-    "static_analysis":    "scripts/static_report.json",
+    "auth_bypass":        f"{REPORT_DIR}/report.json",
+    "unauthorized_drain": f"{REPORT_DIR}/drain_report.json",
+    "integer_overflow":   f"{REPORT_DIR}/overflow_report.json",
+    "reentrancy":         f"{REPORT_DIR}/reentrancy_report.json",
+    "static_analysis":    f"{REPORT_DIR}/static_report.json",
 }
+
+with open(f"{REPORT_DIR}/combined_report.json", "w") as f:
+    json.dump(combined, f, indent=2)
 
 def run_script(script, env_vars):
     print(f"\n{'='*60}")
@@ -142,3 +146,5 @@ if __name__ == "__main__":
 
     blocked = print_final_report(reports)
     sys.exit(1 if blocked else 0)
+
+    

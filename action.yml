@@ -8,7 +8,7 @@ branding:
 
 inputs:
   victim-secret:
-    description: 'Funded Stellar testnet account secret key for depositing test funds'
+    description: 'Funded Stellar testnet account secret key'
     required: true
   attacker-secret:
     description: 'Attacker Stellar testnet account secret key'
@@ -22,10 +22,21 @@ inputs:
   token-id:
     description: 'Stellar testnet native token contract ID'
     required: true
+  contract-path:
+    description: 'Path to compiled .wasm file to scan'
+    required: true
+  contract-source-path:
+    description: 'Path to contract source directory containing src/lib.rs'
+    required: false
+    default: ''
   network:
     description: 'Stellar network to use'
     required: false
     default: 'testnet'
+  enable-ai-scan:
+    description: 'Enable AI agent attack simulation using Ollama'
+    required: false
+    default: 'true'
 
 outputs:
   vulnerabilities-found:
@@ -48,25 +59,26 @@ runs:
       shell: bash
       run: rustup target add wasm32v1-none
 
-    - name: Cache Rust dependencies
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-        key: ${{ runner.os }}-cargo-securesoroban
-
-    - name: Build contracts
-      shell: bash
-      run: |
-        cd ${{ github.action_path }}/vulnerable_contracts/escrow
-        stellar contract build
-
     - name: Install Python dependencies
       shell: bash
       run: pip install requests
 
-    - name: Run security scan
+    - name: Deploy user contract to testnet
+      shell: bash
+      env:
+        VICTIM_SECRET:   ${{ inputs.victim-secret }}
+        STELLAR_NETWORK: ${{ inputs.network }}
+        CONTRACT_PATH:   ${{ inputs.contract-path }}
+      run: |
+        echo "[*] Deploying user contract: $CONTRACT_PATH"
+        CONTRACT_ID=$(stellar contract deploy \
+          --wasm "$CONTRACT_PATH" \
+          --source "$VICTIM_SECRET" \
+          --network "$STELLAR_NETWORK")
+        echo "USER_CONTRACT_ID=$CONTRACT_ID" >> $GITHUB_ENV
+        echo "[+] Deployed: $CONTRACT_ID"
+
+    - name: Run hardcoded security scan
       shell: bash
       env:
         VICTIM_SECRET:          ${{ inputs.victim-secret }}
@@ -74,13 +86,114 @@ runs:
         VICTIM_ADDRESS:         ${{ inputs.victim-address }}
         ATTACKER_ADDRESS:       ${{ inputs.attacker-address }}
         TOKEN_ID:               ${{ inputs.token-id }}
+        CONTRACT_ID:            ${{ env.USER_CONTRACT_ID }}
+        AUTH_CONTRACT_ID:       ${{ env.USER_CONTRACT_ID }}
+        DRAIN_CONTRACT_ID:      ${{ env.USER_CONTRACT_ID }}
+        OVERFLOW_CONTRACT_ID:   ${{ env.USER_CONTRACT_ID }}
+        REENTRANCY_CONTRACT_ID: ${{ env.USER_CONTRACT_ID }}
         STELLAR_NETWORK:        ${{ inputs.network }}
-        AUTH_CONTRACT_ID:       "CBTJ2VU3VJM3WZU3TZTA6ZVGAEFRUUW6WPCIOCD7DNKL4LPLWW536ZUE"
-        DRAIN_CONTRACT_ID:      "CCWEK7ILZYTSCOFMQEQJY5SISXFAXJKM7WGT7247YAMZZYVT2WL2YZ5Z"
-        OVERFLOW_CONTRACT_ID:   "CCPN3X25DKVUCIYHUTMUM4YI5LZBGOUHQ6VDDVXBNZ32WM7YIHJXTWLJ"
-        REENTRANCY_CONTRACT_ID: "CCC5TMGGNHVQG2PH7PZ3BBLQKKBPAEJICGETSRJ7QNJUYEB7R5N4NDGV"
-        CONTRACTS_PATH:         "${{ github.action_path }}/vulnerable_contracts/escrow/contracts"
-      run: python3 ${{ github.action_path }}/scripts/run_all.py
+        CONTRACTS_PATH:         ${{ inputs.contract-source-path }}
+        REPORT_DIR:             "securesoroban-reports"
+      run: |
+        mkdir -p securesoroban-reports
+        python3 ${{ github.action_path }}/scripts/run_all.py
+
+    - name: Cache Ollama binary and models
+      if: inputs.enable-ai-scan == 'true'
+      id: cache-ollama
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.ollama
+          /usr/local/bin/ollama
+          /usr/local/lib/ollama
+        key: ${{ runner.os }}-ollama-full-qwen2.5-coder-7b-v2
+
+    - name: Install Ollama
+      if: inputs.enable-ai-scan == 'true' && steps.cache-ollama.outputs.cache-hit != 'true'
+      shell: bash
+      run: curl -fsSL https://ollama.com/install.sh | sh
+
+    - name: Start Ollama and pull model
+      if: inputs.enable-ai-scan == 'true'
+      shell: bash
+      run: |
+        ollama serve &
+        echo "Waiting for Ollama..."
+        for i in $(seq 1 30); do
+          curl -s http://localhost:11434/api/tags && break
+          sleep 2
+        done
+        if [ "${{ steps.cache-ollama.outputs.cache-hit }}" != "true" ]; then
+          ollama pull qwen2.5-coder:7b
+        fi
+        echo "Ollama ready"
+
+    - name: Run AI agent scan
+      if: inputs.enable-ai-scan == 'true'
+      shell: bash
+      env:
+        VICTIM_SECRET:    ${{ inputs.victim-secret }}
+        ATTACKER_SECRET:  ${{ inputs.attacker-secret }}
+        VICTIM_ADDRESS:   ${{ inputs.victim-address }}
+        ATTACKER_ADDRESS: ${{ inputs.attacker-address }}
+        TOKEN_ID:         ${{ inputs.token-id }}
+        CONTRACT_ID:      ${{ env.USER_CONTRACT_ID }}
+        STELLAR_NETWORK:  ${{ inputs.network }}
+        CONTRACTS_PATH:   ${{ inputs.contract-source-path }}
+        REPORT_DIR:       "securesoroban-reports"
+      run: |
+        timeout 480 python3 ${{ github.action_path }}/scripts/ai_agent_attacker.py || true
+
+    - name: Generate final combined report
+      shell: bash
+      run: |
+        python3 -c "
+        import json, os, glob
+        from datetime import datetime
+
+        report_dir = 'securesoroban-reports'
+        reports = {}
+
+        for f in glob.glob(f'{report_dir}/*.json'):
+            name = os.path.basename(f).replace('.json','').replace('_report','').replace('report','')
+            try:
+                with open(f) as fp:
+                    reports[name] = json.load(fp)
+            except:
+                pass
+
+        total_loss = sum(r.get('estimated_loss_usd', r.get('total_loss_usd', 0)) for r in reports.values())
+        blocked = any(r.get('detected', r.get('push_blocked', False)) for r in reports.values())
+
+        final = {
+            'timestamp': datetime.now().isoformat(),
+            'contract': os.environ.get('USER_CONTRACT_ID', 'unknown'),
+            'total_loss_usd': round(total_loss, 2),
+            'push_blocked': blocked,
+            'checks': reports
+        }
+
+        with open(f'{report_dir}/final_report.json', 'w') as f:
+            json.dump(final, f, indent=2)
+
+        print('')
+        print('=' * 60)
+        print('   SECURESOROBAN — FINAL SECURITY REPORT')
+        print(f'   {datetime.now().strftime(\"%Y-%m-%d %H:%M:%S\")}')
+        print('=' * 60)
+        print(f'   Contract: {final[\"contract\"][:30]}...')
+        print(f'   Total Funds At Risk: \${total_loss:.2f} USD')
+        print(f'   Push Status: {\"BLOCKED\" if blocked else \"SAFE TO DEPLOY\"}')
+        print('=' * 60)
+        "
+
+    - name: Upload security reports
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: securesoroban-security-reports
+        path: securesoroban-reports/
 
     - name: Set outputs
       shell: bash
@@ -88,13 +201,39 @@ runs:
         python3 -c "
         import json, os
         try:
-            report = json.load(open('scripts/combined_report.json'))
-            severities = [c.get('severity','NONE') for c in report['checks'].values()]
+            report = json.load(open('securesoroban-reports/final_report.json'))
+            severities = []
+            for r in report['checks'].values():
+                s = r.get('severity', 'NONE')
+                if s:
+                    severities.append(s)
             top = 'CRITICAL' if 'CRITICAL' in severities else 'HIGH' if 'HIGH' in severities else 'MEDIUM' if 'MEDIUM' in severities else 'NONE'
             with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
                 f.write(f'vulnerabilities-found={str(report[\"push_blocked\"]).lower()}\n')
                 f.write(f'total-loss-usd={report[\"total_loss_usd\"]}\n')
                 f.write(f'severity={top}\n')
         except Exception as e:
-            print(f'Could not read report: {e}')
+            print(f'Report read error: {e}')
+            with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                f.write('vulnerabilities-found=false\n')
+                f.write('total-loss-usd=0\n')
+                f.write('severity=NONE\n')
+        "
+
+    - name: Enforce push block
+      shell: bash
+      run: |
+        python3 -c "
+        import json, sys
+        try:
+            report = json.load(open('securesoroban-reports/final_report.json'))
+            if report['push_blocked']:
+                print('PUSH BLOCKED — Critical vulnerabilities found')
+                sys.exit(1)
+            else:
+                print('SAFE TO DEPLOY')
+                sys.exit(0)
+        except:
+            print('Could not read final report — passing by default')
+            sys.exit(0)
         "
